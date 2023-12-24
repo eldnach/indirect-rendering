@@ -1,0 +1,239 @@
+#pragma kernel ComputeCurves
+#pragma kernel ComputeGeometry
+#pragma kernel ComputeCulling
+
+
+StructuredBuffer<float3> emitterBuffer;
+/*  
+    float3 worldOrigin;
+    float3 worldScale;
+    float3 margin;
+*/
+StructuredBuffer<float3> modelPosBuffer;
+StructuredBuffer<float2> modelUVBuffer;
+StructuredBuffer<int> modelIndexBuffer;
+
+RWStructuredBuffer<float3> curveBuffer;
+
+RWStructuredBuffer<float3> vertexBuffer;
+RWStructuredBuffer<float2> uvBuffer;
+RWByteAddressBuffer indexBuffer;
+RWStructuredBuffer<uint> indirectBuffer;
+/*
+        int index count per instance
+        int instance count
+        int base index offset
+        int base vertex offset
+        int base instance offset
+*/
+
+StructuredBuffer<float4> positionsBuffer;
+AppendStructuredBuffer<float4> culledPositionsBuffer;
+
+uint particleCountX;
+uint particleCountY;
+uint particleCountZ;
+uint modelSize;
+uint modelIndicesSize;
+float modelHeight;
+float4 seed;
+
+uint spawnersCountX;
+uint spawnersCountY;
+
+float4 spawnerScale;
+float4x4 viewProjMat;
+
+float random2D(float2 xy, float2 dir)
+{
+    float val = dot(xy, dir);
+    return frac(9.15 * sin(val));
+}
+
+[numthreads(8,8,1)]
+// once per curve
+void ComputeCurves (uint3 id : SV_DispatchThreadID)
+{
+    uint curveID = id.y * particleCountX + id.x;
+    curveID *= 3;
+
+    float3 worldOrigin = emitterBuffer[0];
+    float3 worldScale = emitterBuffer[1];
+    float3 margin = emitterBuffer[2];
+
+    float x = worldOrigin.x - (worldScale.x * 0.5) + (worldScale.x * 1.0) * (float(id.x) / float(particleCountX));
+    float y = worldScale.y;
+    float z = worldOrigin.z - (worldScale.z * 0.5) + (worldScale.z * 1.0) * (float(id.y) / float(particleCountY));
+
+    float2 uv = float2(float(id.x) / float(particleCountX), float(id.y) / float(particleCountY));
+
+    float3 cp0 = float3(x, 0.0, z);
+    float3 cp1 = float3(x, y / 2.0f, z);
+    float3 cp2 = float3(x, y, z);
+
+    float r0 = random2D(uv, seed.xz);
+    float r1 = random2D(uv, seed.xy);
+    float r2 = random2D(uv, seed.wz);
+    float3 rndm = float3(r0, r1, r2) * 2.0 - 1.0;
+    float3 random0 = float3(rndm.x * 0.1, 0.0         , rndm.z * 0.1);
+    float3 random1 = float3(rndm.y      , 0.0, rndm.x      );
+    float3 random2 = float3(rndm.z * 2.0, -(rndm.y*0.5 + 0.5) * modelHeight * 1.0, rndm.y * 2.0);
+    cp0 += random0;
+    cp1 += random1;
+    cp2 += random2;
+    
+    curveBuffer[curveID] = cp0;
+    curveBuffer[curveID + 1] = cp1;
+    curveBuffer[curveID + 2] = cp2;
+
+}
+
+float3 interpolateTranslation(float t, float3 cp0, float3 cp1, float3 cp2)
+{
+    float3 interpolatedTranslation = (1.0f - t) * (1.0f - t) * cp0 + 2.0f * (1.0f - t) * t * cp1 + t * t * cp2;
+    return interpolatedTranslation;
+}
+
+
+[numthreads(8,8,1)]
+// once per instance
+void ComputeGeometry (uint3 id : SV_DispatchThreadID)
+{	
+    uint instanceID = id.y * particleCountX + id.x; 
+    uint vertexID = instanceID * modelSize;
+    uint indexID = instanceID * modelIndicesSize;
+    uint curveID = instanceID * 3;
+   
+    float3 cp0 = curveBuffer[curveID];
+    float3 cp1 = curveBuffer[curveID+1];
+    float3 cp2 = curveBuffer[curveID+2];
+
+    float2 npc = float2(float(id.x) / float(particleCountX), float(id.y) / float(particleCountY)); // normalized particle coordinate
+    float angle = acos(2.0 * random2D(npc, seed.xz) - 1.0);
+    float4x4 rot = float4x4(
+        float4(cos(angle), 0.0, sin(angle), 0.0),
+        float4(0.0, 1.0, 0.0, 0.0),
+        float4( - sin(angle), 0.0, cos(angle), 0.0),
+        float4(0.0, 0.0, 0.0, 1.0)
+    );
+
+
+    for (int i = 0; i < int(modelSize); i++)
+    {
+        float3 vPos = modelPosBuffer[i]; // read model
+        float2 vUV = modelUVBuffer[i]; // read model
+        
+        float3 t = interpolateTranslation(vPos.y / modelHeight, cp0, cp1, cp2);
+        float3 worldPos = vPos + t;
+
+        float3 p = worldPos - cp0;
+        float4 rotPos = mul(rot, float4(p.x, p.y, p.z, 1.0));
+        rotPos += float4(cp0.x, cp0.y, cp0.z, 1.0);
+
+        vertexBuffer[vertexID + i] = rotPos.xyz;
+        uvBuffer[vertexID + i] = vUV;
+    }
+
+   
+    for (int j = 0; j < int(modelIndicesSize); j++) 
+    {
+        indexBuffer.Store((indexID + j) * 4, instanceID * modelSize + modelIndexBuffer[j]);
+    }
+	
+}
+
+uint IsVisibleAfterFrustumCulling(float4 clipPos)
+{
+    return (clipPos.z > clipPos.w
+        || clipPos.x < -clipPos.w
+        || clipPos.x > clipPos.w
+        || clipPos.y < -clipPos.w
+        || clipPos.y > clipPos.w)
+        ? 0 : 1;
+}
+    
+[numthreads(8, 8, 1)]
+// once per instance
+void ComputeCulling(uint3 id : SV_DispatchThreadID)
+{
+    uint instanceID = id.y * spawnersCountX + id.x;
+    float4 pos = positionsBuffer[instanceID];
+
+    /*
+    float3 bounds = float3(100.0, 100.0, 100.0);
+    // Check if the instance is visible
+    float3 minPos = pos.xyz - bounds;
+    float3 maxPos = pos.xyz + bounds;
+
+    float4 boxCorners[8];
+    boxCorners[0] = float4(minPos.x, minPos.y, minPos.z, 1.0);
+    boxCorners[1] = float4(minPos.x, minPos.y, maxPos.z, 1.0);
+    boxCorners[2] = float4(minPos.x, maxPos.y, minPos.z, 1.0);
+    boxCorners[3] = float4(minPos.x, maxPos.y, maxPos.z, 1.0);
+    boxCorners[4] = float4(maxPos.x, minPos.y, minPos.z, 1.0);
+    boxCorners[5] = float4(maxPos.x, minPos.y, maxPos.z, 1.0);
+    boxCorners[6] = float4(maxPos.x, maxPos.y, minPos.z, 1.0);
+    boxCorners[7] = float4(maxPos.x, maxPos.y, maxPos.z, 1.0);
+
+    float4 clipPos = mul(viewProjMat, boxCorners[0]);
+    uint isInFrustum = IsVisibleAfterFrustumCulling(clipPos);
+
+    clipPos.xyz = clipPos.xyz / clipPos.w;
+    float clipMinX = clipPos.x;
+    float clipMaxX = clipPos.x;
+    float clipMinY = clipPos.y;
+    float clipMaxY = clipPos.y;
+    float clipMinZ = clipPos.z;
+
+    [unroll]
+    for (int i = 1; i < 8; i++)
+    {
+        clipPos = mul(viewProjMat, boxCorners[i]);
+        // For Frustum
+        isInFrustum = saturate(isInFrustum + IsVisibleAfterFrustumCulling(clipPos));
+    }
+ 
+    if (isInFrustum > 0) {
+        culledPositionsBuffer.Append(pos);
+    }
+    */
+
+    float3 bounds = float3(6.0, modelHeight, 6.0);
+    // Check if the instance is visible
+    float3 minPos = pos.xyz - bounds;
+    float3 maxPos = pos.xyz + bounds;
+
+    float4 boxCorners[8];
+    boxCorners[0] = float4(minPos.x, minPos.y, minPos.z, 1.0);
+    boxCorners[1] = float4(minPos.x, minPos.y, maxPos.z, 1.0);
+    boxCorners[2] = float4(minPos.x, maxPos.y, minPos.z, 1.0);
+    boxCorners[3] = float4(minPos.x, maxPos.y, maxPos.z, 1.0);
+    boxCorners[4] = float4(maxPos.x, minPos.y, minPos.z, 1.0);
+    boxCorners[5] = float4(maxPos.x, minPos.y, maxPos.z, 1.0);
+    boxCorners[6] = float4(maxPos.x, maxPos.y, minPos.z, 1.0);
+    boxCorners[7] = float4(maxPos.x, maxPos.y, maxPos.z, 1.0);
+
+    bool visible = false;
+    float2 depthClip;
+    #if (SHADER_API_GLCORE || SHADER_API_GLES3 || SHADER_API_VULKAN )
+        depthClip.x = -1.0;
+        depthClip.y = 1.0;
+    #else
+        depthClip.x = 0.0;
+        depthClip.y = 1.0;
+    #endif
+    for (int i = 0; i < 8; i++)
+    {
+        float4 clipPos = mul(viewProjMat, boxCorners[i]);
+        clipPos.xyz = clipPos.xyz / clipPos.w;
+        if (clipPos.x < 1.0 && clipPos.x > -1.0 && clipPos.y < 1.0 && clipPos.y > -1.0 && clipPos.z < depthClip.y && clipPos.z >  depthClip.x) {
+            visible = true;
+        }
+    }
+    if (visible) {
+        culledPositionsBuffer.Append(pos);
+    }
+
+}
+
+
